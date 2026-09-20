@@ -1,7 +1,88 @@
-import redis, unittest, asyncdispatch
+import redis, unittest, asyncdispatch, std/[os, strutils, options, net]
+
+#[
+Redis connection and database for sync and async tests can be configured with
+environment variables NIM_REDIS_TEST_URL and NIM_REDIS_TEST_DB.
+    - if NIM_REDIS_TEST_URL is not set "localhost" will be used as default
+    - if NIM_REDIS_TEST_URL starts with unix:// a unix socket connection will be used
+    - NIM_REDIS_TEST_URL can optionally include a port (e.g., "localhost:16379")
+    - if NIM_REDIS_TEST_DB is not set or empty, no redis.select() will be executed
+    - if either of these variables has an invalid value, tests will fail with an error
+Example for tests via socket /run/redis/redis.sock using database 15:
+    export NIM_REDIS_TEST_URL=unix:///run/redis/redis.sock
+    export NIM_REDIS_TEST_DB=15
+    nimble test
+]#
+
+type ConnectionConfig = tuple
+  # default host if NIM_REDIS_TEST_URL is not set or empty
+  default: string
+  # host from NIM_REDIS_TEST_URL (if not unix socket)
+  host: Option[string]
+  # will only be some if host is some
+  port: Option[Port]
+  # socket from NIM_REDIS_TEST_URL if it starts with unix://
+  sock: Option[string]
+  # database index from NIM_REDIS_TEST_DB
+  db: Option[int]
+
+proc getConnectionConfig(): ConnectionConfig =
+  ## Parses Redis connection from environment variables `NIM_REDIS_TEST_{URL,DB}`.
+  ## Invalid configurations in variables will intentionally raise errors.
+  result.default = "localhost"
+  let url = getEnv("NIM_REDIS_TEST_URL", "")
+  if url != "":
+    if url.startsWith("unix://"):
+      result.sock = some(url["unix://".len .. ^1])
+    elif ':' in url:
+      let parts = url.split(':')
+      result.host = some(parts[0])
+      result.port = some(Port(parts[1].parseInt))
+    else:
+      result.host = some(url)
+  let dbStr = getEnv("NIM_REDIS_TEST_DB", "")
+  if dbStr != "":
+    result.db = some(dbStr.parseInt)
+
+proc connectSync(): Redis =
+  ## Establishes a synchronous Redis connection for tests.
+  let config = getConnectionConfig()
+  if config.host.isSome:
+    if config.port.isSome:
+      result = redis.open(config.host.get, config.port.get)
+    else:
+      result = redis.open(config.host.get)
+  elif config.sock.isSome:
+    result = redis.openUnix(config.sock.get)
+  else:
+    result = redis.open(config.default)
+  if config.db.isSome:
+    discard result.select(config.db.get)
+  return result
+
+proc connectAsyncAndSetDB(): Future[AsyncRedis] {.async.} =
+  ## Helper to create an asynchronous Redis connection.
+  let config = getConnectionConfig()
+  if config.host.isSome:
+    if config.port.isSome:
+      result = await redis.openAsync(config.host.get, config.port.get)
+    else:
+      result = await redis.openAsync(config.host.get)
+  elif config.sock.isSome:
+    result = await redis.openUnixAsync(config.sock.get)
+  else:
+    result = await redis.openAsync(config.default)
+  if config.db.isSome:
+    discard await result.select(config.db.get)
+  return result
+
+proc connectAsync(): Future[AsyncRedis] =
+  ## Establishes an asynchronous Redis connection for tests.
+  ## Wraps `connectAsyncAndSetDB` to provide a clean `Future[AsyncRedis]`.
+  return connectAsyncAndSetDB()
 
 template syncTests() =
-  let r = redis.open("localhost")
+  let r = connectSync()
   let keys = r.keys("*")
   doAssert keys.len == 0, "Don't want to mess up an existing DB."
 
@@ -177,7 +258,7 @@ suite "redis tests":
   syncTests()
 
 suite "redis async tests":
-  let r = waitFor redis.openAsync("localhost")
+  let r = waitFor connectAsync()
   let keys = waitFor r.keys("*")
   doAssert keys.len == 0, "Don't want to mess up an existing DB."
 
@@ -207,8 +288,8 @@ suite "redis async tests":
   test "pub/sub":
 
     proc main() {.async.} =
-      let sub = waitFor redis.openAsync("localhost")
-      let pub = waitFor redis.openAsync("localhost")
+      let sub = await connectAsync()
+      let pub = await connectAsync()
 
       let listerns = await pub.publish("channel1", "hi there")
       doAssert listerns == 0
@@ -238,4 +319,3 @@ when compileOption("threads"):
   var th: Thread[void]
   createThread(th, threadFunc)
   joinThread(th)
-
